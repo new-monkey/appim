@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+"""appim - 在用户目录安装 AppImage 的私人命令行工具。"""
+
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+__version__ = "0.1.0"
+
+HOME = Path.home()
+BASE = HOME / ".local/share/appiminst"
+APPS_DIR = BASE / "apps"
+DESKTOP_DIR = HOME / ".local/share/applications"
+ICONS_ROOT = HOME / ".local/share/icons/hicolor"
+BIN_DIR = HOME / ".local/bin"
+PLACEHOLDER_ICON = "application-x-executable"
+
+ICON_EXTS = (".svg", ".png", ".xpm", ".jpg", ".jpeg", ".gif", ".ico")
+
+
+def _fail(msg):
+    print(f"错误：{msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def _sanitize(name):
+    return name.replace("/", "-").strip()
+
+
+def slug(name):
+    return re.sub(r"\s+", "-", _sanitize(name).lower())
+
+
+def app_dir(name):
+    return APPS_DIR / _sanitize(name)
+
+
+def desktop_path(name):
+    return DESKTOP_DIR / (_sanitize(name) + ".desktop")
+
+
+def bin_link(name):
+    return BIN_DIR / slug(name)
+
+
+def parse_desktop(path):
+    fields = {"name": None, "icon": None, "exec": None}
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        if key == "Name" and fields["name"] is None:
+            fields["name"] = value.strip()
+        elif key == "Icon" and fields["icon"] is None:
+            fields["icon"] = value.strip()
+        elif key == "Exec" and fields["exec"] is None:
+            fields["exec"] = value.strip()
+    return fields
+
+
+def find_icon(squashfs_root, icon_name):
+    if not icon_name:
+        return None
+    base = icon_name.strip()
+    if Path(base).suffix.lower() in ICON_EXTS:
+        p = squashfs_root / base.lstrip("/")
+        return p if p.exists() else None
+
+    matches = []
+    for ext in ICON_EXTS:
+        matches += list((squashfs_root / "usr/share/icons/hicolor").glob(f"**/apps/{base}{ext}"))
+        matches += list((squashfs_root / "usr/share/icons/hicolor").glob(f"**/{base}{ext}"))
+    for ext in (".png", ".svg", ".xpm"):
+        matches += list((squashfs_root / "usr/share/pixmaps").glob(f"{base}{ext}"))
+        p = squashfs_root / f"{base}{ext}"
+        if p.exists():
+            matches.append(p)
+    if not matches:
+        return None
+
+    def rank(p):
+        ext = p.suffix.lower()
+        ext_rank = {".svg": 3, ".png": 2, ".xpm": 1}.get(ext, 0)
+        m = re.search(r"/hicolor/([^/]+)/", str(p))
+        if not m:
+            return (ext_rank, 0)
+        d = m.group(1)
+        if d == "scalable":
+            return (ext_rank, 100000)
+        return (ext_rank, int(d) if d.isdigit() else 0)
+
+    return max(matches, key=rank)
+
+
+def icon_dest(name, icon_path):
+    stem = _sanitize(name)
+    if icon_path.suffix.lower() == ".svg":
+        d = ICONS_ROOT / "scalable" / "apps"
+        d.mkdir(parents=True, exist_ok=True)
+        return d / (stem + ".svg")
+    m = re.search(r"/hicolor/([^/]+)/", str(icon_path))
+    size = m.group(1) if m else "256"
+    if not size.isdigit():
+        size = "256"
+    d = ICONS_ROOT / size / "apps"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / (stem + icon_path.suffix.lower())
+
+
+def quote_exec_arg(s):
+    escaped = s.replace("\\", "\\\\").replace('"', '\\"').replace("`", "\\`").replace("$", "\\$")
+    return f'"{escaped}"'
+
+
+def rewrite_desktop(src_text, dest, installed_path, icon_val, name):
+    exec_val = quote_exec_arg(str(installed_path))
+    if src_text:
+        for line in src_text.splitlines():
+            if line.startswith("Exec=") and not line.startswith("Exec["):
+                parts = line.split()
+                if len(parts) > 1:
+                    exec_val = " ".join([quote_exec_arg(str(installed_path))] + parts[1:])
+                break
+    out = []
+    seen_exec = seen_icon = False
+    if src_text:
+        for line in src_text.splitlines():
+            if line.startswith("Exec=") and not line.startswith("Exec["):
+                out.append("Exec=" + exec_val)
+                seen_exec = True
+            elif line.startswith("Icon=") and not line.startswith("Icon["):
+                out.append("Icon=" + icon_val)
+                seen_icon = True
+            else:
+                out.append(line)
+        if not seen_exec:
+            out.append("Exec=" + exec_val)
+        if not seen_icon:
+            out.append("Icon=" + icon_val)
+    else:
+        out = [
+            "[Desktop Entry]",
+            "Type=Application",
+            f"Name={name}",
+            f"Exec={exec_val}",
+            f"Icon={icon_val}",
+            "Terminal=false",
+        ]
+    dest.write_text("\n".join(out) + "\n", encoding="utf-8")
+
+
+def remove_app(name, warn_missing=True):
+    d = app_dir(name)
+    if not d.exists():
+        if warn_missing:
+            _fail(f"应用「{name}」未安装")
+        return False
+    removed = []
+    if d.is_dir():
+        shutil.rmtree(d)
+        removed.append(str(d))
+    dp = desktop_path(name)
+    if dp.exists():
+        dp.unlink()
+        removed.append(str(dp))
+    icon_dir = ICONS_ROOT
+    for p in icon_dir.rglob(_sanitize(name) + ".*"):
+        p.unlink()
+        removed.append(str(p))
+    bl = bin_link(name)
+    if bl.is_symlink():
+        bl.unlink()
+        removed.append(str(bl))
+    for r in removed:
+        print(f"已删除 {r}")
+    return True
+
+
+def cmd_install(args):
+    src = Path(args.file)
+    if not src.exists():
+        _fail(f"文件不存在：{src}")
+    if not src.is_file():
+        _fail(f"不是普通文件：{src}")
+    if src.suffix.lower() != ".appimage":
+        _fail(f"不是 AppImage 文件：{src}")
+
+    src = src.resolve()
+    os.chmod(src, os.stat(src).st_mode | 0o111)
+
+    desktop_src = None
+    icon_src = None
+    fields = {"name": None, "icon": None, "exec": None}
+    tmpdir = None
+    try:
+        tmpdir = Path(tempfile.mkdtemp(prefix="appim-"))
+        proc = subprocess.run(
+            [str(src), "--appimage-extract"],
+            cwd=str(tmpdir),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        squashfs = tmpdir / "squashfs-root"
+        if proc.returncode != 0 or not squashfs.is_dir():
+            print("警告：无法解压 AppImage，将使用文件名作为应用名、通用占位图标")
+        else:
+            desktop_candidates = list(squashfs.glob("*.desktop"))
+            if not desktop_candidates:
+                desktop_candidates = list(squashfs.rglob("*.desktop"))
+            if desktop_candidates:
+                desktop_src = desktop_candidates[0]
+                fields = parse_desktop(desktop_src)
+            icon_src = find_icon(squashfs, fields["icon"]) if fields["icon"] else None
+
+        name = fields["name"] or src.stem
+        name = _sanitize(name)
+        if not name:
+            _fail("无法确定应用名")
+
+        remove_app(name, warn_missing=False)
+
+        d = app_dir(name)
+        d.mkdir(parents=True, exist_ok=True)
+        installed = d / src.name
+        shutil.copy2(src, installed)
+        os.chmod(installed, os.stat(installed).st_mode | 0o111)
+
+        icon_val = PLACEHOLDER_ICON
+        if icon_src is not None:
+            dest_icon = icon_dest(name, icon_src)
+            shutil.copy2(icon_src, dest_icon)
+            icon_val = str(dest_icon)
+        else:
+            print(f"警告：未找到图标「{fields['icon']}」，使用通用占位图标")
+
+        BIN_DIR.mkdir(parents=True, exist_ok=True)
+        bl = bin_link(name)
+        if bl.is_symlink():
+            bl.unlink()
+        os.symlink(installed, bl)
+
+        dp = desktop_path(name)
+        desktop_text = desktop_src.read_text(encoding="utf-8", errors="replace") if desktop_src else None
+        rewrite_desktop(desktop_text, dp, installed, icon_val, name)
+    finally:
+        if tmpdir is not None:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    print(f"已安装 {name}")
+    print(f"  应用：{installed}")
+    print(f"  桌面快捷方式：{dp}")
+    print(f"  命令：{bl}")
+    if str(BIN_DIR) not in os.environ.get("PATH", ""):
+        print(f"  提示：{BIN_DIR} 不在 PATH 中，可执行：export PATH=\"$HOME/.local/bin:$PATH\"")
+
+
+def cmd_remove(args):
+    name = " ".join(args.name).strip()
+    if not name:
+        _fail("缺少应用名")
+    remove_app(name)
+
+
+def cmd_list(args):
+    if not APPS_DIR.is_dir():
+        print("未安装任何应用")
+        return
+    apps = sorted(p for p in APPS_DIR.iterdir() if p.is_dir())
+    if not apps:
+        print("未安装任何应用")
+        return
+    for d in apps:
+        appimages = list(d.glob("*.AppImage")) or list(d.glob("*.appimage")) or list(d.iterdir())
+        print(f"{d.name}\t{appimages[0] if appimages else d}")
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="appim", description="在用户目录安装 AppImage 的私人工具")
+    p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    sub = p.add_subparsers(dest="command", required=True)
+
+    pi = sub.add_parser("install", help="安装一个 AppImage")
+    pi.add_argument("file", help="AppImage 文件路径")
+    pi.set_defaults(func=cmd_install)
+
+    pr = sub.add_parser("remove", help="卸载一个应用")
+    pr.add_argument("name", nargs=argparse.REMAINDER, help="应用名（可含空格，无需引号）")
+    pr.set_defaults(func=cmd_remove)
+
+    pl = sub.add_parser("list", help="列出已装应用")
+    pl.set_defaults(func=cmd_list)
+
+    return p
+
+
+def main():
+    args = build_parser().parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

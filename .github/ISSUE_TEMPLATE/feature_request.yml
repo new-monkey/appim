@@ -1,0 +1,26 @@
+name: Feature request
+description: Suggest a new option, subcommand, or behaviour change
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do that appim doesn't let you do today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: |
+        The command line you would like to be able to run, and what it should do.
+        Keep in mind appim is a single dependency-free script.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: false
